@@ -1,4 +1,5 @@
 import html
+import threading
 from datetime import date, timedelta
 
 import mysql.connector
@@ -148,55 +149,114 @@ def friendly(e):
     return GENERIC_ERROR
 
 
+@st.cache_resource(show_spinner=False)
+def _holder():
+    """One shared connection and lock for the whole app, kept between clicks."""
+    return {"conn": None, "lock": threading.Lock()}
+
+
+def _conn():
+    """Return the shared connection, reconnecting only if it has dropped."""
+    h = _holder()
+    c = h["conn"]
+    if c is not None:
+        try:
+            c.ping(reconnect=True, attempts=2, delay=0)
+            return c
+        except Exception:
+            pass
+    c = mysql.connector.connect(connection_timeout=10, **DB)
+    h["conn"] = c
+    return c
+
+
+def _drop():
+    """Throw the shared connection away so the next call opens a fresh one."""
+    h = _holder()
+    try:
+        if h["conn"] is not None:
+            h["conn"].close()
+    except Exception:
+        pass
+    h["conn"] = None
+
+
+def _rollback(conn):
+    try:
+        if conn is not None:
+            conn.rollback()
+    except Exception:
+        _drop()
+
+
 def query(sql, params=()):
     """Run a SELECT and return a DataFrame (with its columns even when empty)."""
-    conn = None
-    try:
-        conn = mysql.connector.connect(**DB)
-        cur = conn.cursor(dictionary=True)
-        cur.execute(sql, params)
-        rows = cur.fetchall()
-        return pd.DataFrame(rows, columns=cur.column_names)
-    except Error:
+    failed = False
+    rows, cols = [], []
+    with _holder()["lock"]:
+        conn = None
+        try:
+            conn = _conn()
+            cur = conn.cursor(dictionary=True)
+            try:
+                cur.execute(sql, params)
+                rows = cur.fetchall()
+                cols = cur.column_names
+            finally:
+                cur.close()
+            conn.commit()  # ends the read snapshot so later reads see fresh data
+        except Error:
+            failed = True
+            _drop()
+    if failed:
         st.error("We couldn't load this page. Please refresh and try again.")
         st.stop()
-    finally:
-        if conn is not None:
-            conn.close()
+    return pd.DataFrame(rows, columns=cols)
 
 
 def call(proc, args):
     """Run an action. Returns (result tables, message to show if it failed)."""
-    conn = None
-    try:
-        conn = mysql.connector.connect(**DB)
-        cur = conn.cursor(dictionary=True)
-        cur.callproc(proc, args)
-        tables = [pd.DataFrame(r.fetchall(), columns=r.column_names)
-                  for r in cur.stored_results()]
-        conn.commit()
-        return tables, None
-    except Error as e:
-        return [], friendly(e)
-    finally:
-        if conn is not None:
-            conn.close()
+    with _holder()["lock"]:
+        conn = None
+        try:
+            conn = _conn()
+            cur = conn.cursor(dictionary=True)
+            try:
+                cur.callproc(proc, args)
+                tables = [pd.DataFrame(r.fetchall(), columns=r.column_names)
+                          for r in cur.stored_results()]
+            finally:
+                cur.close()
+            conn.commit()
+            return tables, None
+        except Error as e:
+            _rollback(conn)
+            return [], friendly(e)
 
 
 def execute(sql, params=()):
     """Add a row. Returns (new id, message to show if it failed)."""
-    conn = None
-    try:
-        conn = mysql.connector.connect(**DB)
-        cur = conn.cursor()
-        cur.execute(sql, params)
-        conn.commit()
-        return cur.lastrowid, None
-    except Error as e:
-        return None, friendly(e)
-    finally:
-        if conn is not None:
-            conn.close()
+    with _holder()["lock"]:
+        conn = None
+        try:
+            conn = _conn()
+            cur = conn.cursor()
+            try:
+                cur.execute(sql, params)
+                new_id = cur.lastrowid
+            finally:
+                cur.close()
+            conn.commit()
+            return new_id, None
+        except Error as e:
+            _rollback(conn)
+            return None, friendly(e)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def ref(sql):
+    """Lists that rarely change (tournaments, teams, games) are remembered for 60 seconds."""
+    return query(sql)
 
 
 # ---------------------------------------------------------------- ui helpers
@@ -268,16 +328,17 @@ def fmt_date(d):
 
 def go(kind, msg):
     """Show a message after the page reloads, then reload so all data is fresh."""
+    st.cache_data.clear()
     st.session_state["flash"] = (kind, msg)
     st.rerun()
 
 
 # ---------------------------------------------------------------- shared data
 
-tournaments = query(
+tournaments = ref(
     "SELECT tournament_id, tournament_name FROM Tournaments ORDER BY tournament_id")
-teams = query("SELECT team_id, team_name FROM Teams ORDER BY team_name")
-games = query("SELECT game_id, game_name FROM Games ORDER BY game_name")
+teams = ref("SELECT team_id, team_name FROM Teams ORDER BY team_name")
+games = ref("SELECT game_id, game_name FROM Games ORDER BY game_name")
 
 T = dict(zip(tournaments.tournament_id.tolist(), tournaments.tournament_name))
 C = dict(zip(teams.team_id.tolist(), teams.team_name))
